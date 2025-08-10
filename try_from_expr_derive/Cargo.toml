@@ -1,0 +1,17 @@
+[package]
+name = "try_from_expr_derive"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+proc-macro = true # Enables procedural macro functionality
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }       # For generating Rust code
+syn = { workspace = true }         # For parsing Rust code
+
+
+[features]
+default = []
