@@ -1,6 +1,47 @@
-use crate::helpers::{extract_option_inner_type, is_option_type, types::TypeKind};
+use crate::helpers::{is_option_type, types::TypeKind};
 use quote::quote;
 use syn::Type;
+
+// Helper to extract inner type from Vec<T>
+fn extract_vec_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(type_path) = ty {
+        if let Some(seg) = type_path.path.segments.last() {
+            if seg.ident == "Vec" {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                        return Some(inner);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// Helper to extract key and value types from HashMap<K, V> or BTreeMap<K, V>
+fn extract_map_types(ty: &Type) -> Option<(&Type, &Type)> {
+    if let Type::Path(type_path) = ty {
+        if let Some(seg) = type_path.path.segments.last() {
+            let ident_str = seg.ident.to_string();
+            if ident_str == "HashMap" || ident_str == "BTreeMap" {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    let types: Vec<&Type> = args.args.iter().filter_map(|arg| {
+                        if let syn::GenericArgument::Type(ty) = arg {
+                            Some(ty)
+                        } else {
+                            None
+                        }
+                    }).collect();
+                    
+                    if types.len() == 2 {
+                        return Some((types[0], types[1]));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 // Helper to generate the appropriate parser for a given type
 pub fn generate_type_parser(
@@ -26,25 +67,261 @@ pub fn generate_type_parser(
         TypeKind::U8 => quote! { Self::parse_u8_literal(#arg_name) },
         TypeKind::Usize => quote! { Self::parse_usize_literal(#arg_name) },
         TypeKind::Isize => quote! { Self::parse_isize_literal(#arg_name) },
-        TypeKind::OrderedFloat(_) => quote! { Self::parse_ordered_float_literal(#arg_name) },
+        TypeKind::OrderedFloat(inner) => match inner.as_ref() {
+            TypeKind::F32 => quote! {
+                Self::parse_f32_literal(#arg_name).map(::ordered_float::OrderedFloat::<f32>)
+            },
+            TypeKind::F64 | _ => quote! {
+                Self::parse_f64_literal(#arg_name).map(::ordered_float::OrderedFloat::<f64>)
+            },
+        },
         TypeKind::Vec(_inner) => {
-            // For Vec types, we need to parse array literals
-            quote! { Self::parse_vec_literal::<#field_type>(#arg_name) }
+            // Extract the actual inner syn::Type for recursive parsing
+            if let Some(inner_ty) = extract_vec_inner_type(field_type) {
+                let inner_parser = generate_type_parser(inner_ty, quote! { elem });
+                quote! {
+                    {
+                        use ::syn::spanned::Spanned;
+                        let expr = Self::unwrap_expr(#arg_name);
+                        
+                        // Handle vec![...] macro
+                        if let ::syn::Expr::Macro(mac) = expr {
+                            if mac.mac.path.is_ident("vec") {
+                                // Parse the vec! macro content as array elements
+                                let tokens = mac.mac.tokens.clone();
+                                
+                                // Check for vec![x; n] repetition syntax
+                                let tokens_str = tokens.to_string();
+                                if tokens_str.contains(";") {
+                                    return Err(::syn::Error::new(
+                                        mac.span(),
+                                        "vec![value; count] repetition syntax is not supported. Please use vec![value1, value2, ...] instead"
+                                    ));
+                                }
+                                
+                                if let Ok(array_expr) = ::syn::parse2::<::syn::ExprArray>(tokens) {
+                                    let mut result = Vec::new();
+                                    for elem in array_expr.elems.iter() {
+                                        match #inner_parser {
+                                            Ok(val) => result.push(val),
+                                            Err(e) => return Err(e),
+                                        }
+                                    }
+                                    Ok(result)
+                                } else {
+                                    Err(::syn::Error::new(mac.span(), "Invalid vec! macro syntax"))
+                                }
+                            } else {
+                                Err(::syn::Error::new(mac.span(), "Expected vec! macro or array literal"))
+                            }
+                        }
+                        // Handle [...] array literals
+                        else if let ::syn::Expr::Array(array) = expr {
+                            let mut result = Vec::new();
+                            for elem in array.elems.iter() {
+                                match #inner_parser {
+                                    Ok(val) => result.push(val),
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            Ok(result)
+                        } else {
+                            Err(::syn::Error::new(expr.span(), "Expected vec! macro or array literal [...]"))
+                        }
+                    }
+                }
+            } else {
+                // Fallback if we can't extract inner type
+                quote! { <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name) }
+            }
         }
         TypeKind::Option(_inner) => {
-            // Options are already handled separately in generate_arg_processing
-            quote! { Self::parse_option_literal::<#field_type>(#arg_name) }
+            // Options are handled specially in generate_arg_processing
+            // This shouldn't be reached, but provide a fallback
+            quote! {
+                Err(::syn::Error::new(
+                    #arg_name.span(),
+                    "Option types should be handled by generate_arg_processing"
+                ))
+            }
         }
         TypeKind::HashMap(_, _) | TypeKind::BTreeMap(_, _) => {
-            // Maps need special parsing
-            quote! { Self::parse_map_literal::<#field_type>(#arg_name) }
+            // Extract the actual key and value types for recursive parsing
+            if let Some((key_ty, val_ty)) = extract_map_types(field_type) {
+                let key_parser = generate_type_parser(key_ty, quote! { key_expr });
+                let val_parser = generate_type_parser(val_ty, quote! { val_expr });
+                
+                // Determine if it's HashMap or BTreeMap
+                let is_hashmap = matches!(type_kind, TypeKind::HashMap(_, _));
+                let map_constructor = if is_hashmap {
+                    quote! { ::std::collections::HashMap::new() }
+                } else {
+                    quote! { ::std::collections::BTreeMap::new() }
+                };
+                
+                quote! {
+                    {
+                        use ::syn::spanned::Spanned;
+                        let expr = Self::unwrap_expr(#arg_name);
+                        
+                        // Handle HashMap::from([...]) or BTreeMap::from([...])
+                        if let ::syn::Expr::Call(call) = expr {
+                            // Check if it's a from() call
+                            if let ::syn::Expr::Path(path) = &*call.func {
+                                let segments: Vec<_> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
+                                
+                                // Check for HashMap::from or BTreeMap::from pattern
+                                if segments.len() >= 2 && segments[segments.len() - 1] == "from" {
+                                    if call.args.len() == 1 {
+                                        // Parse the array of tuples
+                                        if let ::syn::Expr::Array(array) = &call.args[0] {
+                                            let mut map = #map_constructor;
+                                            
+                                            for elem in array.elems.iter() {
+                                                // Each element should be a tuple (key, value)
+                                                if let ::syn::Expr::Tuple(tuple) = elem {
+                                                    if tuple.elems.len() == 2 {
+                                                        let key_expr = &tuple.elems[0];
+                                                        let val_expr = &tuple.elems[1];
+                                                        
+                                                        match (#key_parser, #val_parser) {
+                                                            (Ok(k), Ok(v)) => { map.insert(k, v); },
+                                                            (Err(e), _) => return Err(e),
+                                                            (_, Err(e)) => return Err(e),
+                                                        }
+                                                    } else {
+                                                        return Err(::syn::Error::new(
+                                                            tuple.span(),
+                                                            "Map entry must be a tuple of (key, value)"
+                                                        ));
+                                                    }
+                                                } else {
+                                                    return Err(::syn::Error::new(
+                                                        elem.span(),
+                                                        "Map entry must be a tuple of (key, value)"
+                                                    ));
+                                                }
+                                            }
+                                            Ok(map)
+                                        } else {
+                                            Err(::syn::Error::new(
+                                                call.args[0].span(),
+                                                "Expected array literal in from() call"
+                                            ))
+                                        }
+                                    } else {
+                                        Err(::syn::Error::new(call.span(), "from() expects exactly one argument"))
+                                    }
+                                } else {
+                                    // Fallback to TryFrom
+                                    <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name)
+                                }
+                            } else {
+                                // Fallback to TryFrom
+                                <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name)
+                            }
+                        }
+                        // Handle direct array of tuples: [(key, value), ...]
+                        else if let ::syn::Expr::Array(array) = expr {
+                            let mut map = #map_constructor;
+                            
+                            for elem in array.elems.iter() {
+                                // Each element should be a tuple (key, value)
+                                if let ::syn::Expr::Tuple(tuple) = elem {
+                                    if tuple.elems.len() == 2 {
+                                        let key_expr = &tuple.elems[0];
+                                        let val_expr = &tuple.elems[1];
+                                        
+                                        match (#key_parser, #val_parser) {
+                                            (Ok(k), Ok(v)) => { map.insert(k, v); },
+                                            (Err(e), _) => return Err(e),
+                                            (_, Err(e)) => return Err(e),
+                                        }
+                                    } else {
+                                        return Err(::syn::Error::new(
+                                            tuple.span(),
+                                            "Map entry must be a tuple of (key, value)"
+                                        ));
+                                    }
+                                } else {
+                                    return Err(::syn::Error::new(
+                                        elem.span(),
+                                        "Map entry must be a tuple of (key, value)"
+                                    ));
+                                }
+                            }
+                            Ok(map)
+                        } else {
+                            Err(::syn::Error::new(
+                                expr.span(),
+                                "Expected HashMap::from([...]), BTreeMap::from([...]), or array of tuples [(k, v), ...]"
+                            ))
+                        }
+                    }
+                }
+            } else {
+                // Fallback if we can't extract types
+                quote! { <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name) }
+            }
         }
         _ => {
             // For unknown types, assume they implement TryFrom<&syn::Expr> if they derive TryFromExpr
             // This avoids requiring FromStr for custom types
-            quote! { 
+            quote! {
                 <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name)
             }
+        }
+    }
+}
+
+pub fn generate_struct_field_parsing(
+    variant_name: &syn::Ident,
+    fields: &syn::FieldsNamed,
+) -> proc_macro2::TokenStream {
+    let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
+    let field_types: Vec<_> = fields.named.iter().map(|f| &f.ty).collect();
+    
+    let field_parsers: Vec<_> = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
+        let name_str = name.as_ref().unwrap().to_string();
+        let parser = generate_type_parser(ty, quote! { field_expr });
+        
+        quote! {
+            let #name = {
+                let field_expr = field_map.get(#name_str)
+                    .ok_or_else(|| ::syn::Error::new(
+                        struct_expr.span(),
+                        format!("Missing required field '{}' for variant '{}'", #name_str, stringify!(#variant_name))
+                    ))?;
+                match #parser {
+                    Ok(val) => val,
+                    Err(e) => return Err(::syn::Error::new(
+                        field_expr.span(),
+                        format!("Failed to parse field '{}': {}", #name_str, e)
+                    )),
+                }
+            };
+        }
+    }).collect();
+    
+    quote! {
+        {
+            use ::syn::spanned::Spanned;
+            
+            // Build a map of field names to expressions
+            let mut field_map = ::std::collections::HashMap::new();
+            for field in struct_expr.fields.iter() {
+                if let ::syn::Member::Named(name) = &field.member {
+                    field_map.insert(name.to_string(), &field.expr);
+                }
+            }
+            
+            // Parse each field
+            #(#field_parsers)*
+            
+            // Construct the variant
+            Ok(Self::#variant_name {
+                #(#field_names,)*
+            })
         }
     }
 }
@@ -61,22 +338,61 @@ pub fn generate_arg_processing(
         // Special handling for Option types
         if let Type::Path(type_path) = field_type {
             if is_option_type(type_path) {
-                // Extract inner type from Option<T>
-                let inner_type = extract_option_inner_type(type_path);
-                return quote! {
-                    {
-                        let arg = &call_expr.args[0];
-                        match arg {
-                            ::syn::Expr::Path(path) if path.path.is_ident("None") => {
-                                Ok(Self::#variant_name(None))
+                // Extract the actual inner Type from Option<T>
+                let inner_ty = type_path.path.segments.last().and_then(|seg| {
+                    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                        args.args.first().and_then(|arg| {
+                            if let syn::GenericArgument::Type(ty) = arg {
+                                Some(ty)
+                            } else {
+                                None
                             }
-                            _ => match Self::parse_option_inner(arg, &(#inner_type)) {
-                                Ok(val) => Ok(Self::#variant_name(Some(val))),
-                                Err(e) => Err(e.into())
+                        })
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(inner_ty) = inner_ty {
+                    let parse_inner = generate_type_parser(inner_ty, quote! { inner_arg });
+
+                    return quote! {
+                        {
+                            use ::syn::spanned::Spanned;
+                            let arg = &call_expr.args[0];
+                            match arg {
+                                // None
+                                ::syn::Expr::Path(p) if p.path.is_ident("None") => Ok(Self::#variant_name(None)),
+
+                                // Some(inner)
+                                ::syn::Expr::Call(call) => {
+                                    if let ::syn::Expr::Path(p) = &*call.func {
+                                        if p.path.is_ident("Some") && call.args.len() == 1 {
+                                            let inner_arg = &call.args[0];
+                                            match #parse_inner {
+                                                Ok(v) => Ok(Self::#variant_name(Some(v))),
+                                                Err(e) => Err(e),
+                                            }
+                                        } else {
+                                            Err(::syn::Error::new(call.span(), "Expected Some(value) or None"))
+                                        }
+                                    } else {
+                                        Err(::syn::Error::new(call.span(), "Expected Some(value) or None"))
+                                    }
+                                }
+
+                                // Implicit Some: treat a bare value as Some(...)
+                                other => {
+                                    let inner_arg = other;
+                                    match #parse_inner {
+                                        Ok(v) => Ok(Self::#variant_name(Some(v))),
+                                        Err(_) => Err(::syn::Error::new(other.span(), "Expected Some(value) or None"))
+                                    }
+                                }
                             }
                         }
-                    }
-                };
+                    };
+                }
             }
         }
 
@@ -252,57 +568,6 @@ pub fn generate_helper_functions() -> proc_macro2::TokenStream {
             }
         }
 
-        pub fn parse_ordered_float_literal(expr: &::syn::Expr) -> Result<::ordered_float::OrderedFloat<f64>, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
-                    lit_float.base10_parse::<f64>()
-                        .map(::ordered_float::OrderedFloat)
-                        .map_err(|e| ::syn::Error::new(
-                            lit_float.span(),
-                            format!("Invalid float: {}", e)
-                        ))
-                }
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<f64>()
-                        .map(::ordered_float::OrderedFloat)
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid number: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    // Handle negative floats
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
-                            lit_float.base10_parse::<f64>()
-                                .map(|n| ::ordered_float::OrderedFloat(-n))
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_float.span(),
-                                    format!("Invalid float: {}", e)
-                                ))
-                        }
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<f64>()
-                                .map(|n| ::ordered_float::OrderedFloat(-n))
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid number: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected a numeric literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected a numeric literal (integer or float)"
-                )),
-            }
-        }
 
         pub fn parse_f64_literal(expr: &::syn::Expr) -> Result<f64, ::syn::Error> {
             use ::syn::spanned::Spanned;
@@ -646,86 +911,7 @@ pub fn generate_helper_functions() -> proc_macro2::TokenStream {
             }
         }
 
-        pub fn parse_vec_literal<T>(expr: &::syn::Expr) -> Result<T, ::syn::Error>
-        where
-            T: Default,
-        {
-            use ::syn::spanned::Spanned;
-            // For now, return error - Vec parsing would require more complex logic
-            Err(::syn::Error::new(
-                expr.span(),
-                "Vec parsing is not yet supported. Consider implementing TryFrom<&syn::Expr> for your Vec type"
-            ))
-        }
 
-        pub fn parse_option_literal<T>(expr: &::syn::Expr) -> Result<T, ::syn::Error>
-        where
-            T: Default,
-        {
-            use ::syn::spanned::Spanned;
-            // For now, return error - would need to handle Some(...) and None
-            Err(::syn::Error::new(
-                expr.span(),
-                "Option parsing through this method is not yet supported"
-            ))
-        }
 
-        pub fn parse_map_literal<T>(expr: &::syn::Expr) -> Result<T, ::syn::Error>
-        where
-            T: Default,
-        {
-            use ::syn::spanned::Spanned;
-            // For now, return error - map parsing would be very complex
-            Err(::syn::Error::new(
-                expr.span(),
-                "HashMap/BTreeMap parsing is not yet supported"
-            ))
-        }
-
-        pub fn parse_option_inner(expr: &::syn::Expr, inner_type: &str) -> Result<String, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            // For now, handle String inner type
-            match inner_type {
-                "String" => Self::parse_string_literal(expr),
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    format!("Option<{}> parsing not yet supported", inner_type)
-                )),
-            }
-        }
-
-        pub fn parse_typed_argument<T>(expr: &::syn::Expr) -> Result<T, ::syn::Error>
-        where
-            T: std::str::FromStr,
-            <T as std::str::FromStr>::Err: std::fmt::Display,
-        {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-
-            // Try to parse using FromStr
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit, .. }) => {
-                    let string_val = match lit {
-                        ::syn::Lit::Str(s) => s.value(),
-                        ::syn::Lit::Int(i) => i.to_string(),
-                        ::syn::Lit::Float(f) => f.to_string(),
-                        ::syn::Lit::Bool(b) => b.value.to_string(),
-                        ::syn::Lit::Char(c) => c.value().to_string(),
-                        _ => return Err(::syn::Error::new(
-                            lit.span(),
-                            "Unsupported literal type"
-                        )),
-                    };
-                    string_val.parse().map_err(|e| ::syn::Error::new(
-                        lit.span(),
-                        format!("Parse error: {}", e)
-                    ))
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected a literal value"
-                )),
-            }
-        }
     }
 }

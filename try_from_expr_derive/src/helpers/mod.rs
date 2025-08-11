@@ -11,26 +11,6 @@ pub fn is_option_type(type_path: &syn::TypePath) -> bool {
         .unwrap_or(false)
 }
 
-pub fn extract_option_inner_type(type_path: &syn::TypePath) -> String {
-    type_path
-        .path
-        .segments
-        .last()
-        .and_then(|seg| {
-            if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                args.args.first().and_then(|arg| {
-                    if let syn::GenericArgument::Type(Type::Path(inner)) = arg {
-                        inner.path.segments.last().map(|s| s.ident.to_string())
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string())
-}
 
 // Extract the type name from a Type for matching
 pub fn extract_type_name(ty: &Type) -> String {
@@ -51,6 +31,8 @@ pub fn detect_wrapper_enum(data: &syn::DataEnum) -> bool {
         return false;
     }
 
+    // A wrapper enum should only have single-field tuple variants
+    // If there are any unit variants or struct variants, it's not a wrapper enum
     data.variants.iter().all(
         |variant| matches!(&variant.fields, Fields::Unnamed(fields) if fields.unnamed.len() == 1),
     )

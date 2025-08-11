@@ -2,7 +2,7 @@ mod generators;
 mod helpers;
 
 use crate::{
-    generators::{generate_arg_processing, generate_helper_functions},
+    generators::{generate_arg_processing, generate_struct_field_parsing, generate_helper_functions},
     helpers::{detect_wrapper_enum, extract_type_name},
 };
 use proc_macro::TokenStream;
@@ -23,8 +23,24 @@ pub fn derive_try_from_expr(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Detect if this is a wrapper enum or a leaf enum
-    let is_wrapper_enum = detect_wrapper_enum(&data);
+    // Check for explicit mode attribute
+    let mut forced_mode = None;
+    for attr in &input.attrs {
+        if attr.path().is_ident("try_from_expr") {
+            if let Ok(list) = attr.meta.require_list() {
+                if let Ok(nested) = list.parse_args::<syn::Ident>() {
+                    match nested.to_string().as_str() {
+                        "wrapper" => forced_mode = Some(true),
+                        "leaf" => forced_mode = Some(false),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    
+    // Detect if this is a wrapper enum or a leaf enum (or use forced mode)
+    let is_wrapper_enum = forced_mode.unwrap_or_else(|| detect_wrapper_enum(&data));
 
     if is_wrapper_enum {
         generate_wrapper_enum_impl(&input, &enum_name, &data)
@@ -60,6 +76,7 @@ fn generate_wrapper_enum_impl(
         .map(|(variant_name, field_type)| {
             use crate::helpers::types::TypeKind;
             let type_name = extract_type_name(field_type);
+            let type_name_lit = syn::LitStr::new(&type_name, proc_macro2::Span::call_site());
             
             // Check if this is a basic type we can parse directly
             let type_kind = TypeKind::parse_syn_ty(field_type);
@@ -80,9 +97,11 @@ fn generate_wrapper_enum_impl(
             };
             
             quote! {
-                #type_name => #parse_expr
-                    .map(#enum_name::#variant_name)
-                    .map_err(|e| ::syn::Error::new(expr.span(), format!("Failed to parse {}: {}", #type_name, e))),
+                #type_name_lit => {
+                    return #parse_expr
+                        .map(#enum_name::#variant_name)
+                        .map_err(|e| ::syn::Error::new(expr.span(), format!("Failed to parse {}: {}", #type_name_lit, e)))
+                },
             }
         })
         .collect();
@@ -112,9 +131,39 @@ fn generate_wrapper_enum_impl(
             };
             
             quote! {
-                if let Ok(val) = #parse_expr {
-                    return Ok(#enum_name::#variant_name(val));
+                {
+                    match #parse_expr {
+                        Ok(v) => return Ok(#enum_name::#variant_name(v)),
+                        Err(e) => {
+                            if let Some(mut a) = acc.take() { 
+                                a.combine(e); 
+                                acc = Some(a); 
+                            } else { 
+                                acc = Some(e); 
+                            }
+                        }
+                    }
                 }
+            }
+        })
+        .collect();
+
+    // Generate unit variant arms for wrapper enums
+    let unit_variant_arms: Vec<_> = data
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            let variant_name = &variant.ident;
+            let variant_str = variant_name.to_string();
+
+            match &variant.fields {
+                Fields::Unit => {
+                    let variant_lit = syn::LitStr::new(&variant_str, proc_macro2::Span::call_site());
+                    Some(quote! {
+                        #variant_lit => return Ok(#enum_name::#variant_name),
+                    })
+                },
+                _ => None,
             }
         })
         .collect();
@@ -129,27 +178,40 @@ fn generate_wrapper_enum_impl(
                 // Unwrap parentheses and groups
                 let expr = Self::unwrap_expr(expr);
 
-                // Try type-driven dispatch first
-                if let Ok(enum_type) = Self::determine_enum_type(expr) {
-                    let result = match enum_type.as_str() {
-                        #(#type_match_arms)*
-                        _ => {
-                            // Fall through to try all children
-                            Err(::syn::Error::new(expr.span(), "No matching type"))
+                // Check for unit variants first (e.g., Default, None, etc.)
+                if let ::syn::Expr::Path(path_expr) = expr {
+                    let path = &path_expr.path;
+                    if let Some(last) = path.segments.last() {
+                        let variant_str = last.ident.to_string();
+                        match variant_str.as_str() {
+                            #(#unit_variant_arms)*
+                            _ => {}
                         }
-                    };
-                    if result.is_ok() {
-                        return result;
                     }
                 }
 
-                // Fallback: try each child type
+                // Try type-driven dispatch first
+                if let Ok(mut enum_type) = Self::determine_enum_type(expr) {
+                    // Normalize "Self" to the actual enum name
+                    if enum_type == "Self" {
+                        enum_type = stringify!(#enum_name).to_string();
+                    }
+                    match enum_type.as_str() {
+                        #(#type_match_arms)*
+                        _ => {
+                            // Fall through to try all children
+                        }
+                    }
+                }
+
+                // Fallback: try each child type and aggregate errors
+                let mut acc: Option<::syn::Error> = None;
                 #(#fallback_attempts)*
 
-                Err(::syn::Error::new(
+                Err(acc.unwrap_or_else(|| ::syn::Error::new(
                     expr.span(),
-                    format!("No matching enum variant could parse this expression for {}", stringify!(#enum_name))
-                ))
+                    format!("No variant of {} could parse this expression", stringify!(#enum_name))
+                )))
             }
         }
 
@@ -198,15 +260,18 @@ fn generate_leaf_enum_impl(
             let variant_str = variant_name.to_string();
 
             match &variant.fields {
-                Fields::Unit => Some(quote! {
-                    #variant_str => Ok(#enum_name::#variant_name),
-                }),
+                Fields::Unit => {
+                    let variant_lit = syn::LitStr::new(&variant_str, proc_macro2::Span::call_site());
+                    Some(quote! {
+                        #variant_lit => Ok(#enum_name::#variant_name),
+                    })
+                },
                 _ => None,
             }
         })
         .collect();
 
-    // Collect parametrized variant information
+    // Collect parametrized variant information (tuple variants)
     let param_variant_names: Vec<String> = data
         .variants
         .iter()
@@ -220,8 +285,23 @@ fn generate_leaf_enum_impl(
     } else {
         param_variant_names.join(", ")
     };
+    
+    // Collect struct variant information
+    let struct_variant_names: Vec<String> = data
+        .variants
+        .iter()
+        .filter_map(|v| match &v.fields {
+            Fields::Named(_) => Some(v.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+    let _struct_variants_str = if struct_variant_names.is_empty() {
+        "(no struct variants)".to_string()
+    } else {
+        struct_variant_names.join(", ")
+    };
 
-    // Generate match arms for call expressions (variants with parameters)
+    // Generate match arms for call expressions (tuple variants with parameters)
     let call_variant_arms: Vec<_> = data
         .variants
         .iter()
@@ -233,9 +313,10 @@ fn generate_leaf_enum_impl(
                 Fields::Unnamed(fields) => {
                     let field_count = fields.unnamed.len();
                     let arg_processing = generate_arg_processing(variant_name, &fields.unnamed);
+                    let variant_lit = syn::LitStr::new(&variant_str, proc_macro2::Span::call_site());
 
                     Some(quote! {
-                        #variant_str => {
+                        #variant_lit => {
                             if call_expr.args.len() != #field_count {
                                 return Err(::syn::Error::new(
                                     call_expr.span(),
@@ -250,6 +331,30 @@ fn generate_leaf_enum_impl(
                                 ));
                             }
                             #arg_processing
+                        },
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    
+    // Generate match arms for struct expressions (struct variants)
+    let struct_variant_arms: Vec<_> = data
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            let variant_name = &variant.ident;
+            let variant_str = variant_name.to_string();
+
+            match &variant.fields {
+                Fields::Named(fields) => {
+                    let field_parsers = generate_struct_field_parsing(variant_name, fields);
+                    let variant_lit = syn::LitStr::new(&variant_str, proc_macro2::Span::call_site());
+                    
+                    Some(quote! {
+                        #variant_lit => {
+                            #field_parsers
                         },
                     })
                 }
@@ -277,8 +382,12 @@ fn generate_leaf_enum_impl(
                             let enum_name_seg = &path.segments[path.segments.len() - 2].ident;
                             let variant_name = &path.segments[path.segments.len() - 1].ident;
 
-                            // Verify this is the correct enum
-                            if enum_name_seg.to_string() == stringify!(#enum_name) {
+                            // Verify this is the correct enum (supports both EnumName and Self)
+                            let enum_ident_str = stringify!(#enum_name);
+                            let enum_name_str = enum_name_seg.to_string();
+                            let matches_enum = enum_name_str == enum_ident_str || enum_name_str == "Self";
+                            
+                            if matches_enum {
                                 let variant_str = variant_name.to_string();
                                 match variant_str.as_str() {
                                     #(#unit_variant_arms)*
@@ -334,7 +443,11 @@ fn generate_leaf_enum_impl(
                                 let enum_name_seg = &path.segments[path.segments.len() - 2].ident;
                                 let variant_name = &path.segments[path.segments.len() - 1].ident;
 
-                                if enum_name_seg.to_string() == stringify!(#enum_name) {
+                                let enum_ident_str = stringify!(#enum_name);
+                                let enum_name_str = enum_name_seg.to_string();
+                                let matches_enum = enum_name_str == enum_ident_str || enum_name_str == "Self";
+                                
+                                if matches_enum {
                                     let variant_str = variant_name.to_string();
                                     match variant_str.as_str() {
                                         #(#call_variant_arms)*
@@ -371,10 +484,53 @@ fn generate_leaf_enum_impl(
                         }
                     }
 
+                    // Handle struct variants like StringEnum::Config { min: 5, max: 10 }
+                    ::syn::Expr::Struct(struct_expr) => {
+                        let path = &struct_expr.path;
+                        
+                        if path.segments.len() >= 2 {
+                            let enum_name_seg = &path.segments[path.segments.len() - 2].ident;
+                            let variant_name = &path.segments[path.segments.len() - 1].ident;
+
+                            let enum_ident_str = stringify!(#enum_name);
+                            let enum_name_str = enum_name_seg.to_string();
+                            let matches_enum = enum_name_str == enum_ident_str || enum_name_str == "Self";
+                            
+                            if matches_enum {
+                                let variant_str = variant_name.to_string();
+                                match variant_str.as_str() {
+                                    #(#struct_variant_arms)*
+                                    _ => Err(::syn::Error::new(
+                                        variant_name.span(),
+                                        format!(
+                                            "Unknown struct variant '{}' for enum '{}'",
+                                            variant_str,
+                                            stringify!(#enum_name)
+                                        )
+                                    )),
+                                }
+                            } else {
+                                Err(::syn::Error::new(
+                                    enum_name_seg.span(),
+                                    format!("Expected {}, got {}", stringify!(#enum_name), enum_name_seg)
+                                ))
+                            }
+                        } else {
+                            Err(::syn::Error::new(
+                                struct_expr.span(),
+                                format!(
+                                    "Invalid struct expression format. Expected '{}::VariantName {{ fields... }}'",
+                                    stringify!(#enum_name)
+                                )
+                            ))
+                        }
+                    }
+
                     _ => Err(::syn::Error::new(
                         expr.span(),
                         format!(
-                            "Unsupported expression type for enum '{}'. Expected either a path (e.g., {}::Variant) or a call expression (e.g., {}::Variant(value))",
+                            "Unsupported expression type for enum '{}'. Expected a path (e.g., {}::Variant), call expression (e.g., {}::Variant(value)), or struct expression (e.g., {}::Variant {{ field: value }})",
+                            stringify!(#enum_name),
                             stringify!(#enum_name),
                             stringify!(#enum_name),
                             stringify!(#enum_name)
