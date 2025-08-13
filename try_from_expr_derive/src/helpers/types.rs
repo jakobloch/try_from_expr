@@ -37,7 +37,7 @@ impl TypeKind {
     pub fn parse_syn_ty(ty: &SynType) -> TypeKind {
         use quote::ToTokens;
 
-        let result = match ty {
+        match ty {
             // Path types (most common - String, Vec<T>, custom types, etc.)
             SynType::Path(tp) => Self::handle_type_path(tp),
 
@@ -85,9 +85,7 @@ impl TypeKind {
 
             // Future-proofing for new syn variants
             _ => TypeKind::Other(ty.to_token_stream().to_string()),
-        };
-
-        result
+        }
     }
 
     fn handle_tuple(t: &syn::TypeTuple) -> TypeKind {
