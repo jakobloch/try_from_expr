@@ -5,12 +5,12 @@ edition = "2024"
 
 
 [lib]
-proc-macro = true # Enables procedural macro functionality
+proc-macro = true
 
 [dependencies]
-proc-macro2 = { workspace = true }
-quote = { workspace = true }       # For generating Rust code
-syn = { workspace = true }         # For parsing Rust code
+proc-macro2 = "1.0.95"
+quote = "1.0.40"
+syn = { workspace = true }
 
 
 [features]

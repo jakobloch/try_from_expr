@@ -1,0 +1,6 @@
+[workspace]
+members = ["try_from_expr", "try_from_expr_derive"]
+resolver = "2"
+
+[workspace.dependencies]
+syn = { version = "2.0.104", features = ["full"] }
