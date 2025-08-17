@@ -25,14 +25,18 @@ fn extract_map_types(ty: &Type) -> Option<(&Type, &Type)> {
             let ident_str = seg.ident.to_string();
             if ident_str == "HashMap" || ident_str == "BTreeMap" {
                 if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                    let types: Vec<&Type> = args.args.iter().filter_map(|arg| {
-                        if let syn::GenericArgument::Type(ty) = arg {
-                            Some(ty)
-                        } else {
-                            None
-                        }
-                    }).collect();
-                    
+                    let types: Vec<&Type> = args
+                        .args
+                        .iter()
+                        .filter_map(|arg| {
+                            if let syn::GenericArgument::Type(ty) = arg {
+                                Some(ty)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
                     if types.len() == 2 {
                         return Some((types[0], types[1]));
                     }
@@ -83,13 +87,13 @@ pub fn generate_type_parser(
                     {
                         use ::syn::spanned::Spanned;
                         let expr = Self::unwrap_expr(#arg_name);
-                        
+
                         // Handle vec![...] macro
                         if let ::syn::Expr::Macro(mac) = expr {
                             if mac.mac.path.is_ident("vec") {
                                 // Parse the vec! macro content as array elements
                                 let tokens = mac.mac.tokens.clone();
-                                
+
                                 // Check for vec![x; n] repetition syntax
                                 let tokens_str = tokens.to_string();
                                 if tokens_str.contains(";") {
@@ -98,7 +102,7 @@ pub fn generate_type_parser(
                                         "vec![value; count] repetition syntax is not supported. Please use vec![value1, value2, ...] instead"
                                     ));
                                 }
-                                
+
                                 if let Ok(array_expr) = ::syn::parse2::<::syn::ExprArray>(tokens) {
                                     let mut result = Vec::new();
                                     for elem in array_expr.elems.iter() {
@@ -136,21 +140,39 @@ pub fn generate_type_parser(
             }
         }
         TypeKind::Option(_inner) => {
-            // Options are handled specially in generate_arg_processing
-            // This shouldn't be reached, but provide a fallback
-            quote! {
-                Err(::syn::Error::new(
-                    #arg_name.span(),
-                    "Option types should be handled by generate_arg_processing"
-                ))
+            // This case is for Option types that are NOT inside a tuple variant,
+            // e.g., in a struct.
+            if let Type::Path(type_path) = field_type {
+                if let Some(inner_ty) = crate::helpers::extract_option_inner_type(type_path) {
+                    let parse_inner = generate_type_parser(inner_ty, quote! { inner_arg });
+                    return quote! {
+                        {
+                            use ::syn::spanned::Spanned;
+                            match #arg_name {
+                                ::syn::Expr::Path(p) if p.path.is_ident("None") => Ok(None),
+                                ::syn::Expr::Call(call) if call.func.to_token_stream().to_string() == "Some" && call.args.len() == 1 => {
+                                    let inner_arg = &call.args[0];
+                                    #parse_inner.map(Some)
+                                }
+                                other => {
+                                    // Implicit Some
+                                    let inner_arg = other;
+                                    #parse_inner.map(Some)
+                                }
+                            }
+                        }
+                    };
+                }
             }
+            // Fallback
+            quote! { <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name) }
         }
         TypeKind::HashMap(_, _) | TypeKind::BTreeMap(_, _) => {
             // Extract the actual key and value types for recursive parsing
             if let Some((key_ty, val_ty)) = extract_map_types(field_type) {
                 let key_parser = generate_type_parser(key_ty, quote! { key_expr });
                 let val_parser = generate_type_parser(val_ty, quote! { val_expr });
-                
+
                 // Determine if it's HashMap or BTreeMap
                 let is_hashmap = matches!(type_kind, TypeKind::HashMap(_, _));
                 let map_constructor = if is_hashmap {
@@ -158,104 +180,36 @@ pub fn generate_type_parser(
                 } else {
                     quote! { ::std::collections::BTreeMap::new() }
                 };
-                
+
                 quote! {
                     {
                         use ::syn::spanned::Spanned;
                         let expr = Self::unwrap_expr(#arg_name);
-                        
-                        // Handle HashMap::from([...]) or BTreeMap::from([...])
-                        if let ::syn::Expr::Call(call) = expr {
-                            // Check if it's a from() call
-                            if let ::syn::Expr::Path(path) = &*call.func {
-                                let segments: Vec<_> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
-                                
-                                // Check for HashMap::from or BTreeMap::from pattern
-                                if segments.len() >= 2 && segments[segments.len() - 1] == "from" {
-                                    if call.args.len() == 1 {
-                                        // Parse the array of tuples
-                                        if let ::syn::Expr::Array(array) = &call.args[0] {
-                                            let mut map = #map_constructor;
-                                            
-                                            for elem in array.elems.iter() {
-                                                // Each element should be a tuple (key, value)
-                                                if let ::syn::Expr::Tuple(tuple) = elem {
-                                                    if tuple.elems.len() == 2 {
-                                                        let key_expr = &tuple.elems[0];
-                                                        let val_expr = &tuple.elems[1];
-                                                        
-                                                        match (#key_parser, #val_parser) {
-                                                            (Ok(k), Ok(v)) => { map.insert(k, v); },
-                                                            (Err(e), _) => return Err(e),
-                                                            (_, Err(e)) => return Err(e),
-                                                        }
-                                                    } else {
-                                                        return Err(::syn::Error::new(
-                                                            tuple.span(),
-                                                            "Map entry must be a tuple of (key, value)"
-                                                        ));
-                                                    }
-                                                } else {
-                                                    return Err(::syn::Error::new(
-                                                        elem.span(),
-                                                        "Map entry must be a tuple of (key, value)"
-                                                    ));
-                                                }
-                                            }
-                                            Ok(map)
-                                        } else {
-                                            Err(::syn::Error::new(
-                                                call.args[0].span(),
-                                                "Expected array literal in from() call"
-                                            ))
-                                        }
-                                    } else {
-                                        Err(::syn::Error::new(call.span(), "from() expects exactly one argument"))
-                                    }
-                                } else {
-                                    // Fallback to TryFrom
-                                    <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name)
-                                }
-                            } else {
-                                // Fallback to TryFrom
-                                <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name)
-                            }
-                        }
-                        // Handle direct array of tuples: [(key, value), ...]
-                        else if let ::syn::Expr::Array(array) = expr {
+
+                        if let ::syn::Expr::Array(array) = expr {
                             let mut map = #map_constructor;
-                            
+
                             for elem in array.elems.iter() {
-                                // Each element should be a tuple (key, value)
                                 if let ::syn::Expr::Tuple(tuple) = elem {
                                     if tuple.elems.len() == 2 {
                                         let key_expr = &tuple.elems[0];
                                         let val_expr = &tuple.elems[1];
-                                        
+
                                         match (#key_parser, #val_parser) {
                                             (Ok(k), Ok(v)) => { map.insert(k, v); },
                                             (Err(e), _) => return Err(e),
                                             (_, Err(e)) => return Err(e),
                                         }
                                     } else {
-                                        return Err(::syn::Error::new(
-                                            tuple.span(),
-                                            "Map entry must be a tuple of (key, value)"
-                                        ));
+                                        return Err(::syn::Error::new(tuple.span(), "Map entry must be a tuple of (key, value)"));
                                     }
                                 } else {
-                                    return Err(::syn::Error::new(
-                                        elem.span(),
-                                        "Map entry must be a tuple of (key, value)"
-                                    ));
+                                    return Err(::syn::Error::new(elem.span(), "Map entry must be a tuple of (key, value)"));
                                 }
                             }
                             Ok(map)
                         } else {
-                            Err(::syn::Error::new(
-                                expr.span(),
-                                "Expected HashMap::from([...]), BTreeMap::from([...]), or array of tuples [(k, v), ...]"
-                            ))
+                            Err(::syn::Error::new(expr.span(), "Expected an array of tuples [(k, v), ...] for map"))
                         }
                     }
                 }
@@ -265,8 +219,7 @@ pub fn generate_type_parser(
             }
         }
         _ => {
-            // For unknown types, assume they implement TryFrom<&syn::Expr> if they derive TryFromExpr
-            // This avoids requiring FromStr for custom types
+            // For unknown types, assume they implement TryFrom<&syn::Expr>
             quote! {
                 <#field_type as TryFrom<&::syn::Expr>>::try_from(#arg_name)
             }
@@ -278,47 +231,68 @@ pub fn generate_struct_field_parsing(
     variant_name: &syn::Ident,
     fields: &syn::FieldsNamed,
 ) -> proc_macro2::TokenStream {
-    let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
-    let field_types: Vec<_> = fields.named.iter().map(|f| &f.ty).collect();
-    
-    let field_parsers: Vec<_> = field_names.iter().zip(field_types.iter()).map(|(name, ty)| {
-        let name_str = name.as_ref().unwrap().to_string();
-        let parser = generate_type_parser(ty, quote! { field_expr });
-        
-        quote! {
-            let #name = {
-                let field_expr = field_map.get(#name_str)
-                    .ok_or_else(|| ::syn::Error::new(
-                        struct_expr.span(),
-                        format!("Missing required field '{}' for variant '{}'", #name_str, stringify!(#variant_name))
-                    ))?;
-                match #parser {
-                    Ok(val) => val,
-                    Err(e) => return Err(::syn::Error::new(
-                        field_expr.span(),
-                        format!("Failed to parse field '{}': {}", #name_str, e)
-                    )),
-                }
-            };
+    let field_parsers: Vec<_> = fields.named.iter().map(|f| {
+        let name = f.ident.as_ref().unwrap();
+        let name_str = name.to_string();
+        let ty = &f.ty;
+
+        let is_option = if let Type::Path(tp) = ty {
+            is_option_type(tp)
+        } else {
+            false
+        };
+
+        if is_option {
+            let inner_parser = generate_type_parser(ty, quote! { field_expr });
+            quote! {
+                let #name = if let Some(field_expr) = field_map.get(#name_str) {
+                    match #inner_parser {
+                        Ok(val) => val,
+                        Err(e) => return Err(::syn::Error::new(
+                            field_expr.span(),
+                            format!("Failed to parse optional field '{}': {}", #name_str, e)
+                        )),
+                    }
+                } else {
+                    None
+                };
+            }
+        } else {
+            let parser = generate_type_parser(ty, quote! { field_expr });
+            quote! {
+                let #name = {
+                    let field_expr = field_map.get(#name_str)
+                        .ok_or_else(|| ::syn::Error::new(
+                            struct_expr.span(),
+                            format!("Missing required field '{}' for variant '{}'", #name_str, stringify!(#variant_name))
+                        ))?;
+                    match #parser {
+                        Ok(val) => val,
+                        Err(e) => return Err(::syn::Error::new(
+                            field_expr.span(),
+                            format!("Failed to parse field '{}': {}", #name_str, e)
+                        )),
+                    }
+                };
+            }
         }
     }).collect();
-    
+
+    let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
+
     quote! {
         {
             use ::syn::spanned::Spanned;
-            
-            // Build a map of field names to expressions
+
             let mut field_map = ::std::collections::HashMap::new();
             for field in struct_expr.fields.iter() {
                 if let ::syn::Member::Named(name) = &field.member {
                     field_map.insert(name.to_string(), &field.expr);
                 }
             }
-            
-            // Parse each field
+
             #(#field_parsers)*
-            
-            // Construct the variant
+
             Ok(Self::#variant_name {
                 #(#field_names,)*
             })
@@ -330,64 +304,34 @@ pub fn generate_arg_processing(
     variant_name: &syn::Ident,
     fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
 ) -> proc_macro2::TokenStream {
-    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+    let field_count = fields.len();
 
-    if field_types.len() == 1 {
-        let field_type = &field_types[0];
-
-        // Special handling for Option types
-        if let Type::Path(type_path) = field_type {
+    // Special case for single-argument Option<T> to allow implicit Some(v)
+    if field_count == 1 {
+        let field = fields.first().unwrap();
+        if let Type::Path(type_path) = &field.ty {
             if is_option_type(type_path) {
-                // Extract the actual inner Type from Option<T>
-                let inner_ty = type_path.path.segments.last().and_then(|seg| {
-                    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                        args.args.first().and_then(|arg| {
-                            if let syn::GenericArgument::Type(ty) = arg {
-                                Some(ty)
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                });
-
-                if let Some(inner_ty) = inner_ty {
+                if let Some(inner_ty) = crate::helpers::extract_option_inner_type(type_path) {
                     let parse_inner = generate_type_parser(inner_ty, quote! { inner_arg });
-
                     return quote! {
                         {
                             use ::syn::spanned::Spanned;
+                            if call_expr.args.len() != 1 {
+                                return Err(::syn::Error::new(call_expr.span(), "Variant expects one argument for Option<T>"));
+                            }
                             let arg = &call_expr.args[0];
                             match arg {
                                 // None
                                 ::syn::Expr::Path(p) if p.path.is_ident("None") => Ok(Self::#variant_name(None)),
-
                                 // Some(inner)
-                                ::syn::Expr::Call(call) => {
-                                    if let ::syn::Expr::Path(p) = &*call.func {
-                                        if p.path.is_ident("Some") && call.args.len() == 1 {
-                                            let inner_arg = &call.args[0];
-                                            match #parse_inner {
-                                                Ok(v) => Ok(Self::#variant_name(Some(v))),
-                                                Err(e) => Err(e),
-                                            }
-                                        } else {
-                                            Err(::syn::Error::new(call.span(), "Expected Some(value) or None"))
-                                        }
-                                    } else {
-                                        Err(::syn::Error::new(call.span(), "Expected Some(value) or None"))
-                                    }
+                                ::syn::Expr::Call(call) if call.func.to_token_stream().to_string() == "Some" && call.args.len() == 1 => {
+                                    let inner_arg = &call.args[0];
+                                    #parse_inner.map(|v| Self::#variant_name(Some(v)))
                                 }
-
                                 // Implicit Some: treat a bare value as Some(...)
                                 other => {
                                     let inner_arg = other;
-                                    match #parse_inner {
-                                        Ok(v) => Ok(Self::#variant_name(Some(v))),
-                                        Err(_) => Err(::syn::Error::new(other.span(), "Expected Some(value) or None"))
-                                    }
+                                    #parse_inner.map(|v| Self::#variant_name(Some(v)))
                                 }
                             }
                         }
@@ -395,62 +339,171 @@ pub fn generate_arg_processing(
                 }
             }
         }
+    }
 
-        // Use the unified type parser for all other types
-        let parse_expr = generate_type_parser(field_type, quote! { arg });
-        quote! {
-            {
-                use ::syn::spanned::Spanned;
-                let arg = &call_expr.args[0];
-                match #parse_expr {
-                    Ok(val) => Ok(Self::#variant_name(val)),
-                    Err(e) => Err(e.into())
-                }
-            }
-        }
-    } else if field_types.len() == 2 {
-        let field_type1 = &field_types[0];
-        let field_type2 = &field_types[1];
+    // General case for any number of arguments
+    let parsers: Vec<_> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let field_type = &field.ty;
+            let arg_name = quote! { &call_expr.args[#i] };
+            generate_type_parser(field_type, arg_name)
+        })
+        .collect();
 
-        // Generate appropriate parser for each argument type
-        let parse_arg1 = generate_type_parser(field_type1, quote! { arg1 });
-        let parse_arg2 = generate_type_parser(field_type2, quote! { arg2 });
-
-        // Handle two-argument variants with specific type parsing
-        quote! {
-            {
-                use ::syn::spanned::Spanned;
-                let arg1 = &call_expr.args[0];
-                let arg2 = &call_expr.args[1];
-                match (#parse_arg1, #parse_arg2) {
-                    (Ok(val1), Ok(val2)) => Ok(Self::#variant_name(val1, val2)),
-                    (Err(e), _) => Err(::syn::Error::new(
-                        arg1.span(),
-                        format!("Failed to parse first argument for variant '{}': {}",
-                            stringify!(#variant_name), e)
+    let assignments: Vec<_> = (0..field_count)
+        .map(|i| {
+            let var_name =
+                proc_macro2::Ident::new(&format!("val{}", i), proc_macro2::Span::call_site());
+            let parser = &parsers[i];
+            quote! {
+                let #var_name = match #parser {
+                    Ok(val) => val,
+                    Err(e) => return Err(::syn::Error::new(
+                        call_expr.args[#i].span(),
+                        format!("Failed to parse argument {}: {}", #i + 1, e)
                     )),
-                    (_, Err(e)) => Err(::syn::Error::new(
-                        arg2.span(),
-                        format!("Failed to parse second argument for variant '{}': {}",
-                            stringify!(#variant_name), e)
-                    ))
-                }
+                };
             }
-        }
-    } else {
-        let num_fields = field_types.len();
-        quote! {
-            Err(::syn::Error::new(
-                call_expr.span(),
-                format!("Variant '{}' has {} fields, which is not supported. Only 1 or 2 argument variants are supported.",
-                    stringify!(#variant_name), #num_fields)
-            ))
+        })
+        .collect();
+
+    let constructor_args = (0..field_count)
+        .map(|i| proc_macro2::Ident::new(&format!("val{}", i), proc_macro2::Span::call_site()));
+
+    quote! {
+        {
+            use ::syn::spanned::Spanned;
+            if call_expr.args.len() != #field_count {
+                return Err(::syn::Error::new(
+                    call_expr.span(),
+                    format!("Variant '{}' expects {} argument(s), but {} were provided",
+                        stringify!(#variant_name), #field_count, call_expr.args.len())
+                ));
+            }
+
+            #(#assignments)*
+
+            Ok(Self::#variant_name(#(#constructor_args),*))
         }
     }
 }
 
+fn generate_numeric_parsers() -> proc_macro2::TokenStream {
+    let mut parsers = proc_macro2::TokenStream::new();
+
+    let int_types_signed = [
+        ("parse_i8_literal", "i8"),
+        ("parse_i16_literal", "i16"),
+        ("parse_i32_literal", "i32"),
+        ("parse_i64_literal", "i64"),
+        ("parse_isize_literal", "isize"),
+    ];
+
+    for (fn_name, type_name) in int_types_signed.iter() {
+        let fn_ident = syn::Ident::new(fn_name, proc_macro2::Span::call_site());
+        let type_ident = syn::Ident::new(type_name, proc_macro2::Span::call_site());
+        parsers.extend(quote! {
+            pub fn #fn_ident(expr: &::syn::Expr) -> Result<#type_ident, ::syn::Error> {
+                use ::syn::spanned::Spanned;
+                let expr = Self::unwrap_expr(expr);
+                match expr {
+                    ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
+                        lit_int.base10_parse::<#type_ident>().map_err(|e| {
+                            ::syn::Error::new(lit_int.span(), format!("Invalid {}: {}", #type_name, e))
+                        })
+                    }
+                    ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr: inner_expr, .. }) => {
+                        if let ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) = &**inner_expr {
+                            lit_int.base10_parse::<#type_ident>().map(|n| -n).map_err(|e| {
+                                ::syn::Error::new(lit_int.span(), format!("Invalid {}: {}", #type_name, e))
+                            })
+                        } else {
+                            Err(::syn::Error::new(inner_expr.span(), "Expected an integer literal after '-'"))
+                        }
+                    }
+                    _ => Err(::syn::Error::new(expr.span(), "Expected an integer literal")),
+                }
+            }
+        });
+    }
+
+    let int_types_unsigned = [
+        ("parse_u8_literal", "u8"),
+        ("parse_u16_literal", "u16"),
+        ("parse_u32_literal", "u32"),
+        ("parse_u64_literal", "u64"),
+        ("parse_usize_literal", "usize"),
+    ];
+
+    for (fn_name, type_name) in int_types_unsigned.iter() {
+        let fn_ident = syn::Ident::new(fn_name, proc_macro2::Span::call_site());
+        let type_ident = syn::Ident::new(type_name, proc_macro2::Span::call_site());
+        parsers.extend(quote! {
+            pub fn #fn_ident(expr: &::syn::Expr) -> Result<#type_ident, ::syn::Error> {
+                use ::syn::spanned::Spanned;
+                let expr = Self::unwrap_expr(expr);
+                match expr {
+                    ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
+                        lit_int.base10_parse::<#type_ident>().map_err(|e| {
+                            ::syn::Error::new(lit_int.span(), format!("Invalid {}: {}", #type_name, e))
+                        })
+                    }
+                    _ => Err(::syn::Error::new(expr.span(), "Expected an integer literal")),
+                }
+            }
+        });
+    }
+
+    let float_types = [("parse_f32_literal", "f32"), ("parse_f64_literal", "f64")];
+
+    for (fn_name, type_name) in float_types.iter() {
+        let fn_ident = syn::Ident::new(fn_name, proc_macro2::Span::call_site());
+        let type_ident = syn::Ident::new(type_name, proc_macro2::Span::call_site());
+        parsers.extend(quote! {
+            pub fn #fn_ident(expr: &::syn::Expr) -> Result<#type_ident, ::syn::Error> {
+                use ::syn::spanned::Spanned;
+                let expr = Self::unwrap_expr(expr);
+                match expr {
+                    ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
+                        lit_float.base10_parse::<#type_ident>().map_err(|e| {
+                            ::syn::Error::new(lit_float.span(), format!("Invalid {}: {}", #type_name, e))
+                        })
+                    }
+                    ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
+                        lit_int.base10_parse::<#type_ident>().map_err(|e| {
+                            ::syn::Error::new(lit_int.span(), format!("Invalid {}: {}", #type_name, e))
+                        })
+                    }
+                    ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr: inner_expr, .. }) => {
+                         match &**inner_expr {
+                            ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
+                                lit_float.base10_parse::<#type_ident>().map(|n| -n).map_err(|e| {
+                                    ::syn::Error::new(lit_float.span(), format!("Invalid {}: {}", #type_name, e))
+                                })
+                            }
+                            ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
+                                lit_int.base10_parse::<#type_ident>().map(|n| -n).map_err(|e| {
+                                    ::syn::Error::new(lit_int.span(), format!("Invalid {}: {}", #type_name, e))
+                                })
+                            }
+                            _ => Err(::syn::Error::new(inner_expr.span(), "Expected numeric literal after '-'")),
+                        }
+                    }
+                    _ => Err(::syn::Error::new(expr.span(), "Expected a numeric literal")),
+                }
+            }
+        });
+    }
+
+    parsers
+}
+
 // Generate helper functions for parsing
 pub fn generate_helper_functions() -> proc_macro2::TokenStream {
+    let numeric_parsers = generate_numeric_parsers();
+
     quote! {
         // Helper to unwrap Expr::Paren and Expr::Group
         pub fn unwrap_expr(expr: &::syn::Expr) -> &::syn::Expr {
@@ -463,6 +516,7 @@ pub fn generate_helper_functions() -> proc_macro2::TokenStream {
 
         pub fn determine_enum_type(expr: &::syn::Expr) -> Result<String, ::syn::Error> {
             use ::syn::spanned::Spanned;
+            let expr = Self::unwrap_expr(expr);
             match expr {
                 ::syn::Expr::Path(path_expr) => {
                     let path = &path_expr.path;
@@ -470,14 +524,10 @@ pub fn generate_helper_functions() -> proc_macro2::TokenStream {
                         let enum_name = &path.segments[path.segments.len() - 2].ident;
                         Ok(enum_name.to_string())
                     } else if path.segments.len() == 1 {
-                        // Try to infer from variant name for shorthand
                         let variant_name = &path.segments[0].ident;
-                        Ok(variant_name.to_string())
+                        Ok(variant_name.to_string()) // Infer from variant
                     } else {
-                        Err(::syn::Error::new(
-                            path.span(),
-                            "Invalid path format"
-                        ))
+                        Err(::syn::Error::new(path.span(), "Invalid path format"))
                     }
                 }
                 ::syn::Expr::Call(call_expr) => {
@@ -487,22 +537,14 @@ pub fn generate_helper_functions() -> proc_macro2::TokenStream {
                             let enum_name = &path.segments[path.segments.len() - 2].ident;
                             Ok(enum_name.to_string())
                         } else {
-                            Err(::syn::Error::new(
-                                path.span(),
-                                "Invalid call expression format. Expected 'EnumName::VariantName(...)'"
-                            ))
+                            Err(::syn::Error::new(path.span(), "Call must be qualified: Enum::Variant()"))
                         }
                     } else {
-                        Err(::syn::Error::new(
-                            call_expr.span(),
-                            "Invalid syntax: call expression must use a path"
-                        ))
+                        Err(::syn::Error::new(call_expr.span(), "Call expression must use a path"))
                     }
                 }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Unsupported expression type"
-                )),
+                ::syn::Expr::Lit(_) => Err(::syn::Error::new(expr.span(), "Cannot determine enum type from a literal")),
+                _ => Err(::syn::Error::new(expr.span(), "Unsupported expression for type determination")),
             }
         }
 
@@ -516,7 +558,7 @@ pub fn generate_helper_functions() -> proc_macro2::TokenStream {
                 }
                 _ => Err(::syn::Error::new(
                     expr.span(),
-                    "Expected a string literal. Use double quotes for strings (e.g., \"text\")"
+                    "Expected a string literal (e.g., \"text\")"
                 )),
             }
         }
@@ -551,367 +593,6 @@ pub fn generate_helper_functions() -> proc_macro2::TokenStream {
             }
         }
 
-        pub fn parse_usize_literal(expr: &::syn::Expr) -> Result<usize, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse().map_err(|e| ::syn::Error::new(
-                        lit_int.span(),
-                        format!("Invalid usize: {}", e)
-                    ))
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an integer literal (e.g., 42)"
-                )),
-            }
-        }
-
-
-        pub fn parse_f64_literal(expr: &::syn::Expr) -> Result<f64, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
-                    lit_float.base10_parse::<f64>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_float.span(),
-                            format!("Invalid float: {}", e)
-                        ))
-                }
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<f64>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid number: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    // Handle negative floats
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
-                            lit_float.base10_parse::<f64>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_float.span(),
-                                    format!("Invalid float: {}", e)
-                                ))
-                        }
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<f64>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid number: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected a numeric literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected a numeric literal (integer or float)"
-                )),
-            }
-        }
-
-        pub fn parse_i64_literal(expr: &::syn::Expr) -> Result<i64, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<i64>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid i64: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    // Handle negative numbers
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<i64>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid i64: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected an integer literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_i32_literal(expr: &::syn::Expr) -> Result<i32, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<i32>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid i32: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<i32>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid i32: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected an integer literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_i16_literal(expr: &::syn::Expr) -> Result<i16, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<i16>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid i16: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<i16>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid i16: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected an integer literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_i8_literal(expr: &::syn::Expr) -> Result<i8, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<i8>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid i8: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<i8>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid i8: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected an integer literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_isize_literal(expr: &::syn::Expr) -> Result<isize, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<isize>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid isize: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<isize>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid isize: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected an integer literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_u64_literal(expr: &::syn::Expr) -> Result<u64, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<u64>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid u64: {}", e)
-                        ))
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an unsigned integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_u32_literal(expr: &::syn::Expr) -> Result<u32, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<u32>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid u32: {}", e)
-                        ))
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an unsigned integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_u16_literal(expr: &::syn::Expr) -> Result<u16, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<u16>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid u16: {}", e)
-                        ))
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an unsigned integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_u8_literal(expr: &::syn::Expr) -> Result<u8, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<u8>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid u8: {}", e)
-                        ))
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected an unsigned integer literal"
-                )),
-            }
-        }
-
-        pub fn parse_f32_literal(expr: &::syn::Expr) -> Result<f32, ::syn::Error> {
-            use ::syn::spanned::Spanned;
-            let expr = Self::unwrap_expr(expr);
-            match expr {
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
-                    lit_float.base10_parse::<f32>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_float.span(),
-                            format!("Invalid f32: {}", e)
-                        ))
-                }
-                ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                    lit_int.base10_parse::<f32>()
-                        .map_err(|e| ::syn::Error::new(
-                            lit_int.span(),
-                            format!("Invalid number: {}", e)
-                        ))
-                }
-                ::syn::Expr::Unary(::syn::ExprUnary { op: ::syn::UnOp::Neg(_), expr, .. }) => {
-                    match &**expr {
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Float(lit_float), .. }) => {
-                            lit_float.base10_parse::<f32>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_float.span(),
-                                    format!("Invalid f32: {}", e)
-                                ))
-                        }
-                        ::syn::Expr::Lit(::syn::ExprLit { lit: ::syn::Lit::Int(lit_int), .. }) => {
-                            lit_int.base10_parse::<f32>()
-                                .map(|n| -n)
-                                .map_err(|e| ::syn::Error::new(
-                                    lit_int.span(),
-                                    format!("Invalid number: {}", e)
-                                ))
-                        }
-                        _ => Err(::syn::Error::new(
-                            expr.span(),
-                            "Expected a numeric literal after negative sign"
-                        )),
-                    }
-                }
-                _ => Err(::syn::Error::new(
-                    expr.span(),
-                    "Expected a numeric literal (integer or float)"
-                )),
-            }
-        }
-
-
-
+        #numeric_parsers
     }
 }
