@@ -2,6 +2,12 @@
 name = "try_from_expr"
 version = "0.1.0"
 edition = "2024"
+authors = ["Jakob Lochinski"]
+description = "A procedural macro for generating TryFrom<&syn::Expr> implementations for enums"
+license = "MIT"
+repository = "https://github.com/rymskip/try_from_expr"
+keywords = ["syn", "parser", "macro", "derive", "expr"]
+categories = ["development-tools::procedural-macro-helpers", "parsing"]
 
 [lib]
 path = "src/lib.rs"

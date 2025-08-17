@@ -2,6 +2,12 @@
 name = "try_from_expr_derive"
 version = "0.1.0"
 edition = "2024"
+authors = ["Jakob Lochinski"]
+description = "Derive macro for try_from_expr - generates TryFrom<&syn::Expr> implementations"
+license = "MIT"
+repository = "https://github.com/rymskip/try_from_expr"
+keywords = ["syn", "parser", "macro", "derive", "proc-macro"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 
 [lib]
