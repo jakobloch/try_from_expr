@@ -13,6 +13,6 @@ categories = ["development-tools::procedural-macro-helpers", "parsing"]
 path = "src/lib.rs"
 
 [dependencies]
-try_from_expr_derive = { path = "../try_from_expr_derive" }
 ordered-float = { version = "5.0.0", features = ["serde"] }
 syn = { workspace = true }
+try_from_expr_derive = { version = "0.1.0", path = "../try_from_expr_derive" }
