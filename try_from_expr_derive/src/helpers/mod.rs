@@ -1,6 +1,20 @@
 pub mod types;
 
-use syn::{Fields, Type};
+use syn::{Fields, GenericArgument, PathArguments, Type};
+
+// Extract the inner type from Option<T>
+pub fn extract_option_inner_type(type_path: &syn::TypePath) -> Option<&Type> {
+    type_path.path.segments.last().and_then(|seg| {
+        if seg.ident == "Option" {
+            if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
+                    return Some(inner_ty);
+                }
+            }
+        }
+        None
+    })
+}
 
 pub fn is_option_type(type_path: &syn::TypePath) -> bool {
     type_path
@@ -10,7 +24,6 @@ pub fn is_option_type(type_path: &syn::TypePath) -> bool {
         .map(|seg| seg.ident == "Option")
         .unwrap_or(false)
 }
-
 
 // Extract the type name from a Type for matching
 pub fn extract_type_name(ty: &Type) -> String {
