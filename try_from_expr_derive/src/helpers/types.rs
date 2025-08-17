@@ -1,5 +1,6 @@
 use syn::Type as SynType;
 
+#[derive(Debug)]
 pub enum TypeKind {
     String,
     Char,
@@ -31,6 +32,61 @@ pub enum TypeKind {
     HashMap(Box<TypeKind>, Box<TypeKind>),
     BTreeMap(Box<TypeKind>, Box<TypeKind>),
     Other(String),
+}
+
+impl From<TypeKind> for String {
+    fn from(type_kind: TypeKind) -> Self {
+        match type_kind {
+            TypeKind::String => "String".to_string(),
+            TypeKind::Char => "char".to_string(),
+            TypeKind::Bool => "bool".to_string(),
+            TypeKind::Unit => "()".to_string(),
+            TypeKind::F32 => "f32".to_string(),
+            TypeKind::F64 => "f64".to_string(),
+            TypeKind::I8 => "i8".to_string(),
+            TypeKind::I16 => "i16".to_string(),
+            TypeKind::I32 => "i32".to_string(),
+            TypeKind::I64 => "i64".to_string(),
+            TypeKind::I128 => "i128".to_string(),
+            TypeKind::Isize => "isize".to_string(),
+            TypeKind::U8 => "u8".to_string(),
+            TypeKind::U16 => "u16".to_string(),
+            TypeKind::U32 => "u32".to_string(),
+            TypeKind::U64 => "u64".to_string(),
+            TypeKind::U128 => "u128".to_string(),
+            TypeKind::Usize => "usize".to_string(),
+            TypeKind::DateTime => "DateTime".to_string(),
+            TypeKind::Duration => "Duration".to_string(),
+            TypeKind::Timezone => "Timezone".to_string(),
+            TypeKind::Decimal => "Decimal".to_string(),
+            TypeKind::OrderedFloat(inner) => format!("OrderedFloat<{}>", String::from(*inner)),
+            TypeKind::Tuple(elements) => {
+                let inner = elements
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({})", inner)
+            }
+            TypeKind::Struct(fields) => {
+                let inner = fields
+                    .into_iter()
+                    .map(|(name, ty)| format!("{}: {}", name, String::from(ty)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("struct {{ {} }}", inner)
+            }
+            TypeKind::Option(inner) => format!("Option<{}>", String::from(*inner)),
+            TypeKind::Vec(inner) => format!("Vec<{}>", String::from(*inner)),
+            TypeKind::HashMap(key, value) => {
+                format!("HashMap<{}, {}>", String::from(*key), String::from(*value))
+            }
+            TypeKind::BTreeMap(key, value) => {
+                format!("BTreeMap<{}, {}>", String::from(*key), String::from(*value))
+            }
+            TypeKind::Other(name) => name,
+        }
+    }
 }
 
 impl TypeKind {
